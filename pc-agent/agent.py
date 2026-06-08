@@ -1,19 +1,22 @@
-"""Collect PC metrics and send them to the ESP32 display over USB serial."""
+"""Collect PC metrics and send them to the ESP32 display over USB serial or WiFi."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 import time
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import psutil
 import serial
 import serial.tools.list_ports
+from dotenv import load_dotenv
 
 try:
     with warnings.catch_warnings():
@@ -31,13 +34,54 @@ try:
 except ImportError:
     HAS_PYCAW = False
 
+try:
+    from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
+
+    HAS_ZEROCONF = True
+except ImportError:
+    HAS_ZEROCONF = False
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = ROOT_DIR / ".env"
+DEFAULT_HOSTNAME = "esp32-pc-monitor"
+DEFAULT_PORT = 5000
+MDNS_SERVICE = "_pcmonitor._tcp.local."
+DISCOVERY_TIMEOUT = 5.0
+
 
 @dataclass
 class AgentConfig:
+    transport: str = "serial"
     port: str | None = None
     baud: int = 115200
     interval: float = 1.0
     gpu_index: int = 0
+    wifi_host: str | None = None
+    wifi_port: int = DEFAULT_PORT
+    discover_timeout: float = DISCOVERY_TIMEOUT
+
+
+@dataclass
+class EnvSettings:
+    wifi_ssid: str = ""
+    wifi_password: str = ""
+    device_hostname: str = DEFAULT_HOSTNAME
+    stats_port: int = DEFAULT_PORT
+
+
+def load_settings() -> EnvSettings:
+    load_dotenv(ENV_FILE)
+    import os
+
+    hostname = os.getenv("DEVICE_HOSTNAME", DEFAULT_HOSTNAME).strip().lower() or DEFAULT_HOSTNAME
+    port_raw = os.getenv("STATS_PORT", str(DEFAULT_PORT)).strip()
+    return EnvSettings(
+        wifi_ssid=os.getenv("WIFI_SSID", "").strip(),
+        wifi_password=os.getenv("WIFI_PASSWORD", "").strip(),
+        device_hostname=hostname,
+        stats_port=int(port_raw) if port_raw.isdigit() else DEFAULT_PORT,
+    )
 
 
 def list_serial_ports() -> list[str]:
@@ -143,16 +187,90 @@ def open_serial(port: str, baud: int) -> serial.Serial:
         raise
 
 
-def run(config: AgentConfig) -> None:
-    port = pick_port(config.port)
-    gpu = GpuMonitor(config.gpu_index)
-    volume = VolumeMonitor()
+def discover_wifi_target(hostname: str, port: int, timeout: float) -> tuple[str, int]:
+    if not HAS_ZEROCONF:
+        raise RuntimeError("WiFi discovery requires the 'zeroconf' package. Run: pip install -r requirements.txt")
 
+    found: dict[str, tuple[str, int]] = {}
+    service_name = f"{hostname}.{MDNS_SERVICE}"
+
+    class Browser:
+        def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            pass
+
+        def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            info = zc.get_service_info(type_, name, timeout=1000)
+            if not info or not info.addresses:
+                return
+            address = socket.inet_ntoa(info.addresses[0])
+            service_port = info.port or port
+            found[name] = (address, service_port)
+
+        def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            self.add_service(zc, type_, name)
+
+    zeroconf = Zeroconf()
+    try:
+        print(f"Discovering {MDNS_SERVICE} (timeout {timeout:.0f}s)...", flush=True)
+        browser = ServiceBrowser(zeroconf, MDNS_SERVICE, Browser())
+        deadline = time.time() + timeout
+        while time.time() < deadline and not found:
+            time.sleep(0.1)
+
+        if service_name in found:
+            return found[service_name]
+
+        if found:
+            name, endpoint = next(iter(found.items()))
+            print(f"Using discovered service {name}", flush=True)
+            return endpoint
+
+        # Fallback: resolve <hostname>.local directly.
+        try:
+            addrinfo = socket.getaddrinfo(f"{hostname}.local", port, type=socket.SOCK_STREAM)
+            address = addrinfo[0][4][0]
+            print(f"Resolved {hostname}.local -> {address}", flush=True)
+            return address, port
+        except socket.gaierror as exc:
+            raise RuntimeError(
+                f"Could not find ESP32 on the network.\n"
+                f"  - Ensure the display is powered and connected to WiFi\n"
+                f"  - Check .env DEVICE_HOSTNAME matches the firmware ({hostname})\n"
+                f"  - Try USB serial instead: python agent.py --transport serial"
+            ) from exc
+    finally:
+        zeroconf.close()
+
+
+def open_wifi(host: str | None, port: int, settings: EnvSettings, timeout: float) -> socket.socket:
+    hostname = (host or settings.device_hostname).strip().lower()
+    if host and host.replace(".", "").isdigit():
+        address = host
+        target_port = port
+    else:
+        address, target_port = discover_wifi_target(hostname, port, timeout)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    try:
+        sock.connect((address, target_port))
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not connect to {address}:{target_port}.\n"
+            "Ensure the ESP32 is on the same network and WiFi is enabled in firmware."
+        ) from exc
+
+    sock.settimeout(None)
+    print(f"Connected over WiFi to {address}:{target_port}", flush=True)
+    return sock
+
+
+def run_serial_loop(config: AgentConfig, gpu: GpuMonitor, volume: VolumeMonitor) -> None:
+    port = pick_port(config.port)
     print(f"Opening {port} at {config.baud} baud", flush=True)
     print("Press Ctrl+C to stop", flush=True)
 
     with open_serial(port, config.baud) as ser:
-        # Opening the port resets the ESP32; give firmware time to boot.
         time.sleep(3)
         psutil.cpu_percent(interval=None)
 
@@ -167,10 +285,57 @@ def run(config: AgentConfig) -> None:
             time.sleep(config.interval)
 
 
+def run_wifi_loop(config: AgentConfig, settings: EnvSettings, gpu: GpuMonitor, volume: VolumeMonitor) -> None:
+    print("Press Ctrl+C to stop", flush=True)
+    sock = open_wifi(config.wifi_host, config.wifi_port, settings, config.discover_timeout)
+    psutil.cpu_percent(interval=None)
+
+    try:
+        while True:
+            payload = collect_metrics(gpu, volume)
+            line = json.dumps(payload, separators=(",", ":")) + "\n"
+            print(line.strip(), flush=True)
+            try:
+                sock.sendall(line.encode("utf-8"))
+            except OSError as exc:
+                raise RuntimeError("WiFi connection lost. Restart the agent to reconnect.") from exc
+            time.sleep(config.interval)
+    finally:
+        sock.close()
+
+
+def run(config: AgentConfig) -> None:
+    settings = load_settings()
+    gpu = GpuMonitor(config.gpu_index)
+    volume = VolumeMonitor()
+
+    if config.transport == "wifi":
+        run_wifi_loop(config, settings, gpu, volume)
+        return
+
+    if config.transport == "auto":
+        try:
+            run_wifi_loop(config, settings, gpu, volume)
+            return
+        except RuntimeError as exc:
+            print(f"WiFi unavailable ({exc}); falling back to USB serial.", file=sys.stderr, flush=True)
+
+    run_serial_loop(config, gpu, volume)
+
+
 def parse_args() -> AgentConfig:
     parser = argparse.ArgumentParser(description="Send PC stats to the ESP32 display")
+    parser.add_argument(
+        "--transport",
+        choices=["serial", "wifi", "auto"],
+        default="serial",
+        help="serial=USB, wifi=network only, auto=try WiFi then USB",
+    )
     parser.add_argument("--port", help="Serial port, e.g. COM5")
     parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--wifi-host", help="ESP32 IP or mDNS hostname (default: DEVICE_HOSTNAME from .env)")
+    parser.add_argument("--wifi-port", type=int, help="TCP port (default: STATS_PORT from .env)")
+    parser.add_argument("--discover-timeout", type=float, default=DISCOVERY_TIMEOUT, help="mDNS discovery seconds")
     parser.add_argument("--interval", type=float, default=1.0, help="Update interval in seconds")
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--list-ports", action="store_true", help="List serial ports and exit")
@@ -181,11 +346,16 @@ def parse_args() -> AgentConfig:
             print(port)
         raise SystemExit(0)
 
+    settings = load_settings()
     return AgentConfig(
+        transport=args.transport,
         port=args.port,
         baud=args.baud,
         interval=args.interval,
         gpu_index=args.gpu_index,
+        wifi_host=args.wifi_host,
+        wifi_port=args.wifi_port or settings.stats_port,
+        discover_timeout=args.discover_timeout,
     )
 
 

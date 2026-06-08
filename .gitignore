@@ -21,3 +21,7 @@ vendor/
 
 # PC agent venv stamp file
 pc-agent/.deps-installed
+
+# WiFi credentials and generated firmware config
+.env
+firmware/src/wifi_config.h

@@ -6,6 +6,8 @@
 #include "src/lcd_bl_bsp/lcd_bl_pwm_bsp.h"
 #include "stats_ui.h"
 #include "power_ctrl.h"
+#include "wifi_stats.h"
+#include "wifi_config.h"
 
 static stats_snapshot_t current_stats = {
     .gpu = 0,
@@ -60,10 +62,14 @@ void setup()
     power_ctrl_init();
     lvgl_port_init();
     lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
+    wifi_stats_init(parse_stats_line);
 
     Serial.println("ESP32 PC Monitor ready");
-    Serial.println("Send newline-delimited JSON, e.g.:");
+    Serial.println("Send newline-delimited JSON over USB serial or WiFi TCP, e.g.:");
     Serial.println(R"({"gpu":45,"gpu_temp":62,"gpu_mem":78,"cpu":23,"ram":56,"vol":67,"muted":false})");
+    if (wifi_stats_is_connected()) {
+        Serial.printf("WiFi stats endpoint: %s:%d\n", wifi_stats_ip_address(), STATS_TCP_PORT);
+    }
 }
 
 void loop()
@@ -81,6 +87,8 @@ void loop()
             serial_line += c;
         }
     }
+
+    wifi_stats_poll();
 
     if (current_stats.connected && (millis() - last_packet_ms) > 3000) {
         current_stats.connected = false;

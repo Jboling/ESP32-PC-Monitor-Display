@@ -1,8 +1,13 @@
-# Run the PC stats agent and send metrics to the ESP32 display over USB serial.
-# Auto-detects the COM port (Espressif USB VID 303A).
+# Run the PC stats agent and send metrics to the ESP32 display.
+# USB serial: auto-detects COM port (Espressif USB VID 303A).
+# WiFi: discovers the display via mDNS using .env in the project root.
 
 param(
+    [ValidateSet("serial", "wifi", "auto")]
+    [string]$Transport = "serial",
     [string]$Port,
+    [string]$WifiHost,
+    [int]$WifiPort = 0,
     [int]$Baud = 115200,
     [double]$Interval = 1.0,
     [int]$GpuIndex = 0
@@ -128,25 +133,46 @@ function Ensure-Venv {
     $stamp = Join-Path $PSScriptRoot ".venv\.deps-installed"
     if (-not (Test-Path $stamp) -or (Get-Item $requirements).LastWriteTime -gt (Get-Item $stamp).LastWriteTime) {
         Write-Host "Installing dependencies..." -ForegroundColor Cyan
-        & $venvPython -m pip install -r $requirements
+        $pipResult = & $venvPython -m pip install -r $requirements 2>&1
+        if ($pipResult) {
+            $pipResult | ForEach-Object { Write-Host $_ }
+        }
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to install dependencies."
         }
         New-Item -ItemType File -Path $stamp -Force | Out-Null
     }
 
-    return $venvPython
-}
-
-if (-not $Port) {
-    $detected = @(Get-Esp32ComPorts)
-    $Port = Select-ComPort -Candidates $detected
+    return ,$venvPython
 }
 
 $python = Ensure-Venv
 
-Write-Host "Using port: $Port" -ForegroundColor Cyan
-Write-Host "Starting PC agent (Ctrl+C to stop)..." -ForegroundColor Cyan
+$args = @("agent.py", "--transport", $Transport, "--baud", $Baud, "--interval", $Interval, "--gpu-index", $GpuIndex)
 
-& $python agent.py --port $Port --baud $Baud --interval $Interval --gpu-index $GpuIndex
+if ($Transport -in @("serial", "auto")) {
+    if (-not $Port) {
+        $detected = @(Get-Esp32ComPorts)
+        $Port = Select-ComPort -Candidates $detected
+    }
+    $args += @("--port", $Port)
+    Write-Host "Using serial port: $Port" -ForegroundColor Cyan
+}
+
+if ($Transport -in @("wifi", "auto")) {
+    $envFile = Join-Path (Split-Path $PSScriptRoot -Parent) ".env"
+    if (-not (Test-Path $envFile)) {
+        Write-Host "Warning: .env not found. Copy .env.example to .env and set WiFi credentials." -ForegroundColor Yellow
+    }
+    if ($WifiHost) {
+        $args += @("--wifi-host", $WifiHost)
+    }
+    if ($WifiPort -gt 0) {
+        $args += @("--wifi-port", $WifiPort)
+    }
+    Write-Host "Transport: $Transport (mDNS discovery)" -ForegroundColor Cyan
+}
+
+Write-Host "Starting PC agent (Ctrl+C to stop)..." -ForegroundColor Cyan
+& $python @args
 exit $LASTEXITCODE

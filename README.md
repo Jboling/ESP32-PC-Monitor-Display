@@ -7,13 +7,13 @@ The board has a narrow **172×640** IPS panel — ideal for a vertical dashboard
 ## Architecture
 
 ```text
-┌─────────────┐   USB serial (JSON)   ┌──────────────────┐
-│  Windows PC │ ────────────────────► │  ESP32-S3 board  │
+┌─────────────┐  USB serial or WiFi   ┌──────────────────┐
+│  Windows PC │ ────── (JSON) ──────► │  ESP32-S3 board  │
 │  pc-agent   │                       │  LVGL dashboard  │
 └─────────────┘                       └──────────────────┘
 ```
 
-**PC agent** (`pc-agent/`) reads system metrics and sends one JSON line per second over USB.
+**PC agent** (`pc-agent/`) reads system metrics and sends one JSON line per second over **USB serial** or **WiFi TCP**.
 
 **Firmware** (`firmware/`) renders the metrics with LVGL on the built-in display.
 
@@ -49,6 +49,27 @@ This project uses the [pioarduino](https://github.com/pioarduino/platform-espres
 
 ## Quick start
 
+### 0. WiFi setup (optional)
+
+Copy the example env file and add your network credentials:
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env`:
+
+```env
+WIFI_SSID=YourWiFiName
+WIFI_PASSWORD=YourWiFiPassword
+DEVICE_HOSTNAME=esp32-pc-monitor
+STATS_PORT=5000
+```
+
+`.env` is gitignored. Firmware reads it at build time; the PC agent reads it at runtime for mDNS discovery.
+
+After flashing with WiFi configured, the display joins your network and advertises itself as `<DEVICE_HOSTNAME>.local` on port `STATS_PORT`.
+
 ### 1. Flash the firmware
 
 ```powershell
@@ -68,13 +89,36 @@ pio device monitor --port COM5
 
 ### 2. Run the PC agent
 
+**USB serial** (default):
+
 ```powershell
 cd pc-agent
+.\run.ps1
+```
+
+**WiFi** (discovers the display via mDNS):
+
+```powershell
+cd pc-agent
+.\run.ps1 -Transport wifi
+```
+
+**Auto** (try WiFi first, fall back to USB):
+
+```powershell
+.\run.ps1 -Transport auto
+```
+
+Manual usage:
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python agent.py --list-ports
 python agent.py --port COM5
+python agent.py --transport wifi
+python agent.py --transport auto
 ```
 
 GPU stats require an **NVIDIA** GPU and the `pynvml` package. Volume control uses **Windows** audio APIs via `pycaw`. CPU and RAM work on any platform.
@@ -99,7 +143,6 @@ Board support files are copied from Waveshare's `10_LVGL_V9_Test` Arduino exampl
 
 ## Next steps
 
-- **WiFi instead of USB** — add a small HTTP/WebSocket server on the ESP32 so the PC agent can push metrics over the network
 - **Touch controls** — use the capacitive panel to mute/unmute or switch pages
 - **Custom themes** — tweak `stats_ui.c` colors and layout for your desk setup
 - **More metrics** — network throughput, disk usage, per-core CPU, fan speeds
@@ -109,7 +152,9 @@ Board support files are copied from Waveshare's `10_LVGL_V9_Test` Arduino exampl
 | Issue | Fix |
 |-------|-----|
 | Blank display after flash | Confirm USB power; check serial monitor for boot logs |
-| `Waiting for PC...` stuck | Run `agent.py` on the correct COM port at 115200 baud |
+| `Waiting for PC...` stuck | Run `agent.py` on the correct COM port at 115200 baud, or use `--transport wifi` |
+| WiFi connect failed | Check `.env` credentials; re-flash firmware after editing `.env` |
+| Agent can't find display on WiFi | PC and ESP32 must be on the same network; verify mDNS (`esp32-pc-monitor.local`) |
 | GPU always 0 | Install NVIDIA drivers; verify `pynvml` import works |
 | Volume always 0 | Run agent on Windows; install `pycaw` and `comtypes` |
 | Upload timeout | Use boot-mode sequence above; try a lower `upload_speed` in `platformio.ini` |
